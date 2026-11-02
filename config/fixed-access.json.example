@@ -1,0 +1,5 @@
+{
+  "provider": "cloudflare",
+  "public_url": "https://ai.example.com",
+  "tunnel_id": "00000000-0000-0000-0000-000000000000"
+}

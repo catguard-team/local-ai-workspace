@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "bind_ip": "10.77.0.2",
+  "peer_cidr": "10.77.0.0/24",
+  "shared_token": "GENERATE_A_UNIQUE_64_CHARACTER_LOWERCASE_HEX_TOKEN"
+}
+

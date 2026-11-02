@@ -1,0 +1,40 @@
+[Unit]
+Description=Local AI relay through the existing wg-easy network namespace
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+Group=www-data
+WorkingDirectory=/opt/localai-relay
+ExecStart=/usr/bin/python3 -u /opt/localai-relay/relay.py supervise --container wg-easy --upstream-host 10.77.0.2 --upstream-port 8787
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+RuntimeDirectory=localai-relay
+RuntimeDirectoryMode=0750
+UMask=0007
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/run/localai-relay
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
+# Preserve SETUID through Ubuntu/systemd's sandboxed exec; the worker's setuid
+# to www-data clears its permitted, effective and ambient capabilities.
+AmbientCapabilities=CAP_SETUID
+TasksMax=160
+LimitNOFILE=1024
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

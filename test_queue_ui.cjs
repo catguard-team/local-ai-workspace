@@ -1,0 +1,66 @@
+// Run with Node.js: node test_queue_ui.cjs [.runtime/queue-ui-next.html]
+// Exercises the actual inline UI with a small DOM and deterministic network/timer harness.
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const vm = require('node:vm');
+const path = require('node:path');
+const html = fs.readFileSync(path.resolve(__dirname, process.argv[2] || 'sandbox-agent.html'), 'utf8');
+const source = html.split('<script>')[1].split('</script>')[0];
+new vm.Script(source);
+
+class Element {
+  constructor(id = '') { this.id=id;this.value='';this.textContent='';this.hidden=false;this.disabled=false;this.dataset={};this.style={};this.children=[];this.listeners={};this.attributes={};this.scrollHeight=100;this.scrollTop=0;this.clientHeight=100;const values=new Set();this.classList={add:(...names)=>names.forEach(x=>values.add(x)),remove:(...names)=>names.forEach(x=>values.delete(x)),contains:name=>values.has(name),toggle:(name,on)=>{const use=on===undefined?!values.has(name):on;if(use)values.add(name);else values.delete(name);return use;}}; }
+  addEventListener(name, fn) { this.listeners[name]=fn; }
+  setAttribute(name,value) { this.attributes[name]=value; }
+  getAttribute(name) { return this.attributes[name]; }
+  removeAttribute(name) { delete this.attributes[name]; }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children=children; }
+  querySelectorAll() { return []; }
+  focus() {}
+  close() { this.open=false; }
+  showModal() { this.open=true; }
+  remove() {}
+  requestSubmit() { this.submissions=(this.submissions||0)+1; }
+}
+
+function harness() {
+  const elements=new Map(),timers=new Map(),documentEvents={},calls=[];
+  let now=100000,sequence=0;
+  const get=id=>{if(!elements.has(id))elements.set(id,new Element(id));return elements.get(id);};
+  const document={hidden:false,getElementById:get,querySelectorAll:()=>[],createElement:()=>new Element(),addEventListener:(name,fn)=>{documentEvents[name]=fn;},documentElement:{style:{setProperty(){},removeProperty(){}}},body:new Element()};
+  const context=vm.createContext({console,URL,URLSearchParams,Headers,FormData,Map,Set,document,navigator:{},history:{replaceState(){}},window:{location:{search:'',href:'http://localhost/'},innerWidth:1280,addEventListener(){}},performance:{now:()=>now},Date:class extends Date{static now(){return now;}},setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
+  vm.runInContext(source.replace('api("/api/me").then(enterApp).catch(()=>showLogin());',''),context);
+  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin})',context);
+  ui.state.me={username:'test'};
+  context.mockApi=async route=>{calls.push(route);return route==='/api/queue'?{server_busy:false,queue_waiting:0}:{id:ui.state.chat,messages:[],mode:'chat',running:false,request_state:'idle'};};
+  vm.runInContext('api=(...args)=>globalThis.mockApi(...args);',context);
+  return {ui,get,document,documentEvents,timers,calls,context,setNow:value=>{now=value;},now:()=>now,async tick(){const next=[...timers].sort((a,b)=>a[1].due-b[1].due)[0];assert.ok(next,'scheduled poll exists');timers.delete(next[0]);now=next[1].due;next[1].fn();await settle();}};
+}
+async function settle(){for(let i=0;i<12;i++)await Promise.resolve();}
+
+async function main(){
+  let count=0;
+  const test=async(name,fn)=>{await fn();console.log('ok - '+name);count++;};
+  await test('queued, active, cancelling and idle have distinct accessible controls',()=>{
+    const h=harness();h.ui.setRequestState({running:true,request_state:'queued',queue_position:3});
+    assert.equal(h.get('run-status').textContent,'대기 3번째 · 앞선 답변이 끝나면 자동으로 시작합니다.');assert.equal(h.get('cancel-button').textContent,'대기 취소');assert.equal(h.get('cancel-button').disabled,false);assert.equal(h.get('send-button').hidden,true);assert.equal(h.get('run-status').classList.contains('busy'),false);
+    h.ui.setRequestState({request_state:'running'});assert.equal(h.get('cancel-button').textContent,'답변 중지');assert.equal(h.get('run-status').classList.contains('busy'),true);
+    h.ui.setRequestState({request_state:'cancelling'});assert.equal(h.get('cancel-button').disabled,true);assert.equal(h.get('run-status').textContent,'요청을 중지하고 있습니다…');
+    h.ui.setRequestState({request_state:'idle'});assert.equal(h.get('send-button').hidden,false);assert.equal(h.get('run-status').textContent,'');assert.equal(h.get('mode-agent').disabled,false);
+    assert.match(html,/id="run-status" role="status" aria-live="polite" aria-atomic="true"/);assert.match(html,/aria-describedby="queue-help"/);
+  });
+  await test('legacy running state does not invent a queue position',()=>{const h=harness();const view=h.ui.requestView({running:true});assert.equal(view.phase,'running');assert.doesNotMatch(view.text,/번째/);h.ui.setRequestState({request_state:'queued',queue_position:null});assert.match(h.get('run-status').textContent,/^대기 중/);});
+  await test('queued empty assistant is an admission placeholder, not generation',()=>{const h=harness();h.ui.renderMessages({title:'test',running:true,request_state:'queued',messages:[{id:'a',role:'assistant',content:''}]});const node=h.ui.state.nodes.get('a');assert.match(node._content.textContent,/순서가 되면 답변을 시작/);assert.doesNotMatch(node._content.textContent,/작성하고/);assert.equal(node._copyButton.disabled,true);});
+  await test('global status uses aggregate fields only',()=>{const h=harness();h.ui.renderQueue({server_busy:true,queue_waiting:2,username:'SECRET_USER',content:'SECRET_CONTENT'});assert.equal(h.get('queue-summary').textContent,'답변 처리 중 · 대기 2개');h.ui.renderQueue({server_busy:false,queue_waiting:0});assert.equal(h.get('queue-summary').textContent,'모델 사용 가능');});
+  await test('429 admission keeps text and attachments unchanged',async()=>{const h=harness();h.ui.state.chat='chat1';h.ui.state.pending=[{id:'file1',name:'notes.txt'}];h.get('message-input').value='keep this draft';h.context.mockApi=async()=>{throw new Error('요청이 많습니다. 잠시 후 다시 시도해 주세요.');};await h.get('message-form').listeners.submit({preventDefault(){}});assert.equal(h.get('message-input').value,'keep this draft');assert.equal(h.ui.state.pending[0].id,'file1');assert.equal(h.ui.state.requestBusy,false);assert.equal(h.ui.state.running,false);assert.match(h.get('global-error').textContent,/요청이 많습니다/);});
+  await test('successful admission shows queued immediately and clears draft once',async()=>{const h=harness();h.ui.state.chat='chat1';h.get('message-input').value='accepted';h.context.mockApi=async()=>({status:'queued',request_state:'queued',queue_position:2,running:true,server_busy:true,queue_waiting:2});await h.get('message-form').listeners.submit({preventDefault(){}});assert.equal(h.get('message-input').value,'');assert.equal(h.ui.state.requestState,'queued');assert.equal(h.get('cancel-button').textContent,'대기 취소');assert.equal(h.timers.size,1);});
+  await test('queue cancellation becomes idle and schedules one refresh',async()=>{const h=harness();h.ui.state.chat='chat1';h.ui.setRequestState({request_state:'queued',queue_position:1});h.context.mockApi=async()=>({status:'cancelled'});await h.get('cancel-button').listeners.click();assert.equal(h.ui.state.running,false);assert.equal(h.get('send-button').hidden,false);assert.equal(h.timers.size,1);});
+  await test('one polling loop refreshes aggregate at five seconds and active chat at two',async()=>{const h=harness();h.ui.state.chat='chat1';h.context.mockApi=async route=>{h.calls.push(route);return route==='/api/queue'?{server_busy:true,queue_waiting:1}:{request_state:'queued',running:true,queue_position:1,messages:[],mode:'chat'};};await h.ui.refreshLiveState();assert.equal(h.timers.size,1);await h.tick();assert.equal(h.now(),102000);await h.tick();assert.equal(h.now(),104000);await h.tick();assert.equal(h.now(),105000);assert.equal(h.calls.filter(x=>x==='/api/queue').length,2);assert.equal(h.calls.filter(x=>x.includes('/api/chats/')).length,3);assert.equal(h.timers.size,1);});
+  await test('concurrent refreshes and chat switches discard stale responses',async()=>{const h=harness();h.ui.state.chat='old';const resolvers=[];h.context.mockApi=route=>{h.calls.push(route);return new Promise(resolve=>resolvers.push({route,resolve}));};const first=h.ui.refreshLiveState();await h.ui.refreshLiveState();assert.equal(h.calls.length,2);h.ui.state.chat='new';h.ui.state.epoch++;h.ui.state.nextChatPoll=0;h.ui.state.nextQueuePoll=0;h.ui.scheduleLivePoll();for(const item of resolvers)item.resolve(item.route==='/api/queue'?{server_busy:true,queue_waiting:7}:{title:'STALE',request_state:'running',messages:[],mode:'agent'});await first;assert.notEqual(h.get('chat-title').textContent,'STALE');assert.equal(h.ui.state.mode,'chat');assert.notEqual(h.get('queue-summary').textContent,'답변 처리 중 · 대기 7개');assert.equal(h.timers.size,1);});
+  await test('hidden or unauthenticated tabs do not poll; visible tabs restart once',async()=>{const h=harness();h.ui.scheduleLivePoll();assert.equal(h.timers.size,1);h.document.hidden=true;h.documentEvents.visibilitychange();assert.equal(h.timers.size,0);await h.ui.refreshLiveState();assert.equal(h.calls.length,0);h.document.hidden=false;h.documentEvents.visibilitychange();assert.equal(h.timers.size,1);h.ui.showLogin();assert.equal(h.timers.size,0);await h.ui.refreshLiveState();assert.equal(h.calls.length,0);});
+  await test('legacy queue 404 stays quiet and keeps ordinary chat polling',async()=>{const h=harness();h.ui.state.chat='chat1';h.context.mockApi=async route=>{if(route==='/api/queue')throw new Error('Not Found');return{running:true,messages:[],mode:'chat'};};await h.ui.refreshLiveState();assert.equal(h.get('global-error').hidden,true);assert.equal(h.ui.state.requestState,'running');assert.equal(h.timers.size,1);});
+  await test('Enter, Shift+Enter and IME composition behavior remains intact',()=>{const h=harness();const input=h.get('message-input');const key=input.listeners.keydown;let prevented=0;const event={key:'Enter',shiftKey:false,isComposing:false,keyCode:13,preventDefault(){prevented++;}};key({...event,shiftKey:true});key({...event,isComposing:true});assert.equal(h.get('message-form').submissions||0,0);key(event);assert.equal(h.get('message-form').submissions,1);assert.equal(prevented,1);h.ui.setRequestState({request_state:'queued'});key(event);assert.equal(h.get('message-form').submissions,1);});
+  console.log(`${count} queue UI checks passed.`);
+}
+main().catch(error=>{console.error(error);process.exitCode=1;});

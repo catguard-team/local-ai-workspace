@@ -1,0 +1,6 @@
+{
+  "public_url": "https://ai.example.com",
+  "relay_peer": "10.77.0.1",
+  "relay_token": "GENERATE_A_DIFFERENT_64_CHARACTER_LOWERCASE_HEX_TOKEN"
+}
+
