@@ -100,6 +100,49 @@ class AccountSetupTests(unittest.TestCase):
                 prompt_password()
             getpass.assert_not_called()
 
+    def test_delete_removes_only_target_private_data(self):
+        from account_store import delete_user
+        import uuid
+        for name in ('fixture_a', 'fixture_b'):
+            create_user(self.database, name, SYNTHETIC_PASSWORD)
+        uploads = self.database.parent / 'uploads'
+        uploads.mkdir()
+        ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        with closing(sqlite3.connect(self.database)) as con, con:
+            users = dict(con.execute('SELECT username,id FROM users'))
+            for i, name in enumerate(('fixture_a', 'fixture_b')):
+                con.execute('INSERT INTO sessions VALUES(?,?,?)', (name, users[name], 9999999999))
+                con.execute('INSERT INTO chats(id,user_id,title,created_at,updated_at) VALUES(?,?,?,?,?)', (name, users[name], name, 1, 1))
+                con.execute('INSERT INTO messages(id,chat_id,role,content,created_at) VALUES(?,?,?,?,?)', (name, name, 'user', 'fixture', 1))
+                con.execute('INSERT INTO uploads VALUES(?,?,?,?,?,?,?)', (ids[i], users[name], 'note.txt', 'text/plain', 'text', 'fixture', 1))
+                (uploads / ids[i]).write_text('fixture')
+        with patch('account_store.require_backend_stopped'):
+            result = delete_user(self.database, 'fixture_a')
+        self.assertEqual(result['remaining_uploads'], [])
+        self.assertFalse((uploads / ids[0]).exists())
+        self.assertTrue((uploads / ids[1]).exists())
+        with closing(sqlite3.connect(self.database)) as con:
+            for table in ('users', 'sessions', 'chats', 'messages', 'uploads'):
+                self.assertEqual(con.execute('SELECT COUNT(*) FROM ' + table).fetchone()[0], 1)
+        self.assertEqual(list_users(self.database), ['fixture_b'])
+
+    def test_delete_last_or_missing_account_leaves_data(self):
+        from account_store import delete_user
+        create_user(self.database, 'fixture_a', SYNTHETIC_PASSWORD)
+        with patch('account_store.require_backend_stopped'):
+            for name in ('fixture_a', 'missing_user'):
+                with self.assertRaises(ValueError):
+                    delete_user(self.database, name)
+        self.assertEqual(list_users(self.database), ['fixture_a'])
+
+    def test_delete_refuses_running_backend(self):
+        from account_store import delete_user
+        create_user(self.database, 'fixture_a', SYNTHETIC_PASSWORD)
+        with patch('account_store.socket.create_connection'):
+            with self.assertRaisesRegex(RuntimeError, 'Stop the backend'):
+                delete_user(self.database, 'fixture_a')
+        self.assertEqual(list_users(self.database), ['fixture_a'])
+
     def service_fixture(self):
         # The module validates its workspace on import. This is the public
         # checkout's ignored empty workspace, never the live server directory.

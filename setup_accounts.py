@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from account_store import create_user, list_users, normalize_username, password_bytes, reset_password
+from account_store import create_user, delete_user, list_users, normalize_username, password_bytes, reset_password, require_backend_stopped
 
 ROOT = Path(__file__).resolve().parent
 DATABASE = ROOT / ".runtime" / "sandbox-agent" / "app.db"
@@ -54,6 +54,8 @@ def main() -> int:
     create.add_argument("username", nargs="?", help="optional ID; otherwise prompted")
     reset = commands.add_parser("reset-password", help="reset a password and revoke this account's sessions")
     reset.add_argument("username")
+    delete = commands.add_parser("delete", help="offline: delete an account, its sessions, private chats and attachments")
+    delete.add_argument("username")
     commands.add_parser("list", help="list local usernames without hashes or session data")
     args = parser.parse_args()
     try:
@@ -62,6 +64,21 @@ def main() -> int:
                 print(username)
             return 0
         username = normalize_username(args.username or input("Username: "))
+        if args.command == 'delete':
+            require_backend_stopped()
+            if not sys.stdin.isatty():
+                raise RuntimeError('Deletion requires an interactive terminal and username confirmation.')
+            print('Permanently deletes this account, sessions, private chats and attachments. Shared agent/ files stay.')
+            if input(f'Type {username} to confirm deletion: ') != username:
+                raise ValueError('Confirmation did not match; no account was deleted.')
+            prepare_storage()
+            result = delete_user(DATABASE, username)
+            print(f"Deleted {result['username']}: {result['chats']} chats, {result['uploads']} attachments.")
+            if result['remaining_uploads']:
+                print('Account deleted, but these private upload files need manual cleanup in .runtime/sandbox-agent/uploads:', file=sys.stderr)
+                print('\n'.join(result['remaining_uploads']), file=sys.stderr)
+                return 1
+            return 0
         password = prompt_password()
         prepare_storage()
         if args.command == "create":

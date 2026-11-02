@@ -64,6 +64,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\bootstrap.ps1 -Python "C:\
 
 비밀번호 재설정은 해당 계정의 기존 로그인 세션도 만료시킵니다. 다른 계정의 기록이나 대기 중인 요청을 초기화하지 않습니다.
 
+### 계정 추가·조회·비밀번호 변경·삭제
+
+계정 관리는 **서버 PC의 실제 설치 폴더에서 PowerShell로** 실행합니다. 웹 화면에는 관리자용 계정 관리 메뉴가 없습니다. 공유본이나 다른 복사본 폴더에서 실행하면 그 복사본의 DB를 관리하므로 설치 위치를 먼저 확인하세요.
+
+```powershell
+# 새 계정 추가: 비밀번호는 화면 안내에 따라 숨김 입력
+.\.venv\Scripts\python.exe setup_accounts.py create new_user
+# 계정 목록
+.\.venv\Scripts\python.exe setup_accounts.py list
+# 비밀번호 변경: 해당 계정의 기존 로그인 세션도 만료
+.\.venv\Scripts\python.exe setup_accounts.py reset-password new_user
+```
+
+추가와 비밀번호 변경은 서버 실행 중에도 가능합니다. 삭제는 대기·실행 중인 요청을 마무리하고, 필요한 기록을 백업한 뒤 **백엔드를 멈춘 상태에서만** 가능합니다. 숨김 실행 중인 이 설치본의 백엔드는 다음처럼 중지할 수 있습니다. 다른 계정의 접속도 잠시 중단됩니다.
+
+```powershell
+$backendPath = [regex]::Escape((Join-Path $PWD 'sandbox_agent.py')) + '(?:["\s]|$)'
+Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'python.exe' -and $_.CommandLine -match $backendPath
+} | ForEach-Object { Stop-Process -Id $_.ProcessId }
+
+.\.venv\Scripts\python.exe setup_accounts.py delete new_user
+# 삭제 확인에 사용자 이름을 정확히 입력합니다.
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+삭제하면 해당 계정·세션·비공개 대화·첨부를 제거합니다. **공유 `agent/` 파일과 다른 계정 데이터는 유지**합니다. 마지막 남은 계정은 삭제할 수 없으므로 필요한 경우 대체 계정을 먼저 만드세요. 백업에 남은 기록은 별도이며, 이 명령은 디스크의 보안 삭제를 수행하지 않습니다. 첨부 파일을 지우지 못한 경우 계정 삭제 후 남은 파일 ID를 표시하고 오류로 종료하므로 안내된 개인 업로드 폴더에서 정리하세요.
+
 ### 2. LM Studio 모델 준비
 
 LM Studio에서 모델을 내려받거나 가져옵니다. `lms ls`로 로컬 모델 키를 확인합니다.

@@ -5,6 +5,7 @@ from contextlib import closing
 from pathlib import Path
 import re
 import sqlite3
+import socket
 import uuid
 
 import bcrypt
@@ -80,3 +81,51 @@ def list_users(database: Path) -> list[str]:
         if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone():
             return []
         return [row[0] for row in con.execute("SELECT username FROM users ORDER BY username")]
+
+
+def require_backend_stopped() -> None:
+    try:
+        connection = socket.create_connection(('127.0.0.1', 8081), timeout=1)
+    except ConnectionRefusedError:
+        return
+    except OSError as error:
+        raise RuntimeError('Could not confirm that backend port 8081 is stopped.') from error
+    connection.close()
+    raise RuntimeError('Stop the backend on port 8081 before deleting an account. No data was changed.')
+
+
+def delete_user(database: Path, username: str) -> dict:
+    """Offline deletion of one identity and its private data; shared files stay."""
+    require_backend_stopped()
+    username = normalize_username(username)
+    if not database.is_file():
+        raise ValueError('That username does not exist.')
+    uploads = database.parent / 'uploads'
+    if uploads.exists() and (uploads.resolve() != uploads.absolute() or uploads.is_symlink()):
+        raise RuntimeError('Upload storage must not be a filesystem link.')
+    with closing(sqlite3.connect(database, timeout=10)) as con, con:
+        con.execute('PRAGMA foreign_keys=ON')
+        con.execute('BEGIN IMMEDIATE')
+        user = con.execute('SELECT id,username FROM users WHERE username=? COLLATE NOCASE', (username,)).fetchone()
+        if user is None:
+            raise ValueError('That username does not exist.')
+        if con.execute('SELECT COUNT(*) FROM users').fetchone()[0] <= 1:
+            raise ValueError('Cannot delete the last account. Create a replacement account first.')
+        user_id = user[0]
+        file_ids = [row[0] for row in con.execute('SELECT id FROM uploads WHERE user_id=?', (user_id,))]
+        for file_id in file_ids:
+            if str(uuid.UUID(file_id)) != file_id:
+                raise ValueError('Invalid upload ID; account deletion stopped without changes.')
+        chats = con.execute('SELECT COUNT(*) FROM chats WHERE user_id=?', (user_id,)).fetchone()[0]
+        con.execute('DELETE FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE user_id=?)', (user_id,))
+        con.execute('DELETE FROM chats WHERE user_id=?', (user_id,))
+        con.execute('DELETE FROM uploads WHERE user_id=?', (user_id,))
+        con.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+        con.execute('DELETE FROM users WHERE id=?', (user_id,))
+    remaining = []
+    for file_id in file_ids:
+        try:
+            (uploads / file_id).unlink(missing_ok=True)
+        except OSError:
+            remaining.append(file_id)
+    return {'username': user[1], 'chats': chats, 'uploads': len(file_ids), 'remaining_uploads': remaining}
