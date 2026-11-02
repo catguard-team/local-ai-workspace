@@ -35,3 +35,5 @@ node test_queue_ui.cjs
 - 외부 라이브러리 파일을 갱신할 때 버전 정보와 라이선스 고지를 함께 갱신한다.
 
 커밋 전에 `git diff --cached`와 추적 파일 목록을 확인한다. `.runtime/`, `.venv/`, `bin/`, `agent/` 및 개인키가 포함되지 않아야 한다. 보안 제보는 [SECURITY.md](SECURITY.md)의 비공개 절차를 따른다.
+
+검증은 `scripts/check-local.ps1`로 로컬에서 수행합니다. GitHub Actions·유료 CI·예약 외부 실행을 추가하거나 활성화하지 마세요.

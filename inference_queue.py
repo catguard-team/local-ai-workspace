@@ -33,7 +33,7 @@ class Entry:
 
 class FifoQueue:
     def __init__(self, *, max_waiting=8, max_pending_per_user=2,
-                 max_runtime_seconds=900, max_wait_seconds=1800,
+                 max_runtime_seconds=3600, max_wait_seconds=7200,
                  on_state=None, on_finish=None):
         self.limits = dict(max_waiting=max_waiting, max_pending_per_user=max_pending_per_user,
                            max_runtime_seconds=max_runtime_seconds, max_wait_seconds=max_wait_seconds)

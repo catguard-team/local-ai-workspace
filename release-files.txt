@@ -1,7 +1,6 @@
 # Public source allowlist. Keep private state, credentials, installed runtimes and user files out.
 .gitattributes
 .github/pull_request_template.md
-.github/workflows/ci.yml
 .gitignore
 AGENT.md
 AGENTS.md
@@ -57,3 +56,7 @@ vpn_access.py
 write-access.py
 실행.cmd
 docs/SECURITY-UPDATES.md
+inference_settings.py
+test_inference_settings.py
+config/inference-settings.json.example
+scripts/check-local.ps1

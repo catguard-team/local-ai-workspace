@@ -31,7 +31,7 @@ function harness() {
   const document={hidden:false,getElementById:get,querySelectorAll:()=>[],createElement:()=>new Element(),addEventListener:(name,fn)=>{documentEvents[name]=fn;},documentElement:{style:{setProperty(){},removeProperty(){}}},body:new Element()};
   const context=vm.createContext({console,URL,URLSearchParams,Headers,FormData,Map,Set,document,navigator:{},history:{replaceState(){}},window:{location:{search:'',href:'http://localhost/'},innerWidth:1280,addEventListener(){}},performance:{now:()=>now},Date:class extends Date{static now(){return now;}},setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
   vm.runInContext(source.replace('api("/api/me").then(enterApp).catch(()=>showLogin());',''),context);
-  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin})',context);
+  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin,loadChats,openDeleteChat})',context);
   ui.state.me={username:'test'};
   context.mockApi=async route=>{calls.push(route);return route==='/api/queue'?{server_busy:false,queue_waiting:0}:{id:ui.state.chat,messages:[],mode:'chat',running:false,request_state:'idle'};};
   vm.runInContext('api=(...args)=>globalThis.mockApi(...args);',context);
@@ -61,6 +61,40 @@ async function main(){
   await test('hidden or unauthenticated tabs do not poll; visible tabs restart once',async()=>{const h=harness();h.ui.scheduleLivePoll();assert.equal(h.timers.size,1);h.document.hidden=true;h.documentEvents.visibilitychange();assert.equal(h.timers.size,0);await h.ui.refreshLiveState();assert.equal(h.calls.length,0);h.document.hidden=false;h.documentEvents.visibilitychange();assert.equal(h.timers.size,1);h.ui.showLogin();assert.equal(h.timers.size,0);await h.ui.refreshLiveState();assert.equal(h.calls.length,0);});
   await test('legacy queue 404 stays quiet and keeps ordinary chat polling',async()=>{const h=harness();h.ui.state.chat='chat1';h.context.mockApi=async route=>{if(route==='/api/queue')throw new Error('Not Found');return{running:true,messages:[],mode:'chat'};};await h.ui.refreshLiveState();assert.equal(h.get('global-error').hidden,true);assert.equal(h.ui.state.requestState,'running');assert.equal(h.timers.size,1);});
   await test('Enter, Shift+Enter and IME composition behavior remains intact',()=>{const h=harness();const input=h.get('message-input');const key=input.listeners.keydown;let prevented=0;const event={key:'Enter',shiftKey:false,isComposing:false,keyCode:13,preventDefault(){prevented++;}};key({...event,shiftKey:true});key({...event,isComposing:true});assert.equal(h.get('message-form').submissions||0,0);key(event);assert.equal(h.get('message-form').submissions,1);assert.equal(prevented,1);h.ui.setRequestState({request_state:'queued'});key(event);assert.equal(h.get('message-form').submissions,1);});
+  await test('deletion requires explicit confirmation and clears only the selected conversation',async()=>{
+    const h=harness();h.ui.state.chat='delete-me';let deletes=0;
+    h.context.mockApi=async(route,options={})=>{if(options.method==='DELETE'){deletes++;assert.equal(route,'/api/chats/delete-me');return{deleted:'delete-me'};}return[];};
+    h.ui.openDeleteChat({id:'delete-me',title:'<script>untrusted title</script>'});
+    assert.equal(deletes,0);assert.equal(h.get('delete-chat-title').textContent,'<script>untrusted title</script>');assert.equal(h.get('delete-chat-dialog').open,true);
+    await h.get('delete-chat-cancel').listeners.click();assert.equal(deletes,0);assert.equal(h.ui.state.chat,'delete-me');
+    h.ui.openDeleteChat({id:'delete-me'});await h.get('delete-chat-confirm').listeners.click();
+    assert.equal(deletes,1);assert.equal(h.ui.state.chat,null);assert.equal(h.get('delete-chat-dialog').open,false);assert.equal(h.get('empty-chat').hidden,false);
+  });
+  await test('deleting another conversation preserves the current draft and files',async()=>{
+    const h=harness();h.ui.state.chat='current';h.get('message-input').value='keep draft';h.ui.state.pending=[{id:'file'}];
+    h.context.mockApi=async(route,options={})=>options.method==='DELETE'?{deleted:'old'}:[];
+    h.ui.openDeleteChat({id:'old'});await h.get('delete-chat-confirm').listeners.click();
+    assert.equal(h.ui.state.chat,'current');assert.equal(h.get('message-input').value,'keep draft');assert.equal(h.ui.state.pending[0].id,'file');
+  });
+  await test('active-request deletion refusal retains history and shows a retryable error',async()=>{
+    const h=harness();h.ui.state.chat='active';h.context.mockApi=async()=>{throw new Error('답변 중지 후 삭제');};
+    h.ui.openDeleteChat({id:'active'});await h.get('delete-chat-confirm').listeners.click();
+    assert.equal(h.ui.state.chat,'active');assert.equal(h.get('delete-chat-dialog').open,true);assert.match(h.get('delete-chat-error').textContent,/답변 중지/);assert.equal(h.get('delete-chat-confirm').disabled,false);
+  });
+  await test('every history row offers an accessible separate delete control',async()=>{
+    const h=harness();h.context.mockApi=async()=>[{id:'a',title:'My chat',mode:'chat'}];await h.ui.loadChats();
+    const row=h.get('chat-list').children[0];assert.equal(row.children.length,2);assert.equal(row.children[1].getAttribute('aria-label'),'My chat 대화 삭제');
+    row.children[1].listeners.click();assert.equal(h.ui.state.deleteChatId,'a');assert.equal(h.ui.state.chat,null);
+  });
+  await test('late history fetch cannot restore a deleted row',async()=>{
+    const h=harness();let old;h.context.mockApi=()=>new Promise(resolve=>{old=resolve;});const pending=h.ui.loadChats();
+    h.context.mockApi=async()=>[];await h.ui.loadChats();old([{id:'old',title:'deleted'}]);await pending;
+    assert.equal(h.get('chat-list').children[0].textContent,'저장된 대화가 없습니다.');
+  });
+  await test('queue help displays the effective configured minutes',()=>{
+    const h=harness();h.ui.renderQueue({limits:{max_runtime_seconds:3600,max_wait_seconds:7200}});assert.match(h.get('queue-help').textContent,/응답 최대 60분 · 대기 최대 120분/);
+    h.ui.renderQueue({limits:{max_runtime_seconds:5400,max_wait_seconds:10800}});assert.match(h.get('queue-help').textContent,/90분 · 대기 최대 180분/);
+  });
   console.log(`${count} queue UI checks passed.`);
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

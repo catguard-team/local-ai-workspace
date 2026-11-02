@@ -140,22 +140,61 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install-startup.ps1
 
 ## 요청 처리와 데이터
 
-모든 계정과 두 모드는 하나의 FIFO 대기열을 사용합니다. 한 계정은 실행·대기를 합쳐 최대 2개 요청, 서버는 최대 8개 대기 요청을 받습니다. 실행 제한은 15분, 대기 제한은 30분입니다. 서버 재시작으로 중단된 요청은 자동 재실행하지 않으며 부분 응답을 보존합니다.
+모든 계정과 두 모드는 하나의 FIFO 대기열을 사용합니다. 한 계정은 실행·대기를 합쳐 최대 2개 요청, 서버는 최대 8개 대기 요청을 받습니다. 실행 제한은 기본 **60분**, 대기 제한은 **120분**입니다. 서버 재시작으로 중단된 요청은 자동 재실행하지 않으며 부분 응답을 보존합니다.
 
 `.runtime/`에는 계정 해시, 세션, 대화, 첨부, 로그, VPN 설정이 있습니다. `agent/`는 공유 파일 작업 폴더입니다. 서비스를 멈춘 뒤 이 두 폴더를 별도로 백업하세요. Git과 소스 ZIP에서는 모두 제외됩니다.
+
+### 이전 대화 삭제
+
+왼쪽 대화 목록에서 대화 오른쪽의 **삭제**를 누른 뒤 확인 창에서 **삭제**를 선택합니다. 모바일에서는 왼쪽 위 메뉴(☰)로 목록을 엽니다. 현재 대화를 삭제하면 새 대화 화면으로 돌아갑니다. 다른 대화를 삭제하면 작성 중인 입력은 유지됩니다.
+
+대화와 메시지는 영구 삭제됩니다. 계정의 **최근 첨부 보관함**과 공유 `agent/` 파일은 유지됩니다. 답변 중이거나 대기 중인 대화는 먼저 **답변 중지 / 대기 취소**를 누르고 중지가 끝난 뒤 삭제하세요. 다른 계정의 대화는 조회하거나 삭제할 수 없습니다. 백업본의 기록은 별도이며 디스크 보안 삭제 기능은 아닙니다.
+
+### 응답 시간 설정
+
+파일이 없으면 60분/120분 기본값을 사용합니다. 값을 바꾸려면 저장소의 `.runtime/inference-settings.json`을 만들거나 편집하세요. [예시 파일](config/inference-settings.json.example)의 내용은 다음과 같습니다.
+
+```json
+{
+  "max_response_minutes": 60,
+  "max_queue_wait_minutes": 120
+}
+```
+
+| 설정 | 의미 | 기본값 |
+| --- | --- | --- |
+| `max_response_minutes` | 대기 후 실제 실행이 시작된 시점부터 한 답변과 에이전트 도구 작업 전체의 제한 | 60분 |
+| `max_queue_wait_minutes` | 다른 요청 뒤에서 기다릴 수 있는 시간 | 120분 |
+
+단위는 분이며 1~1440의 정수만 허용합니다. 대기 제한은 응답 제한 이상이어야 합니다. 예를 들어 90분 응답/180분 대기는 각각 `90`, `180`으로 설정합니다. 잘못된 설정은 시작 오류로 알려주며 무시하지 않습니다. 제한을 늘려도 모델 속도·메모리·문맥 크기나 출력 토큰 상한은 바뀌지 않습니다.
+
+**저장 후 백엔드를 재시작해야 반영됩니다.** 다른 사용자의 실행·대기 요청까지 끝난 상태에서 저장소 폴더의 PowerShell에서 다음을 실행하세요. 진행 중인 답변이 있으면 재시작으로 끊기므로 먼저 화면에서 완료 또는 중지를 확인합니다.
+
+```powershell
+$backendPath = [regex]::Escape((Join-Path $PWD 'sandbox_agent.py')) + '(?:["\s]|$)'
+Get-CimInstance Win32_Process | Where-Object {
+    $_.Name -eq 'python.exe' -and $_.CommandLine -match $backendPath
+} | ForEach-Object { Stop-Process -Id $_.ProcessId }
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+화면의 대기열 안내와 로그인한 상태의 `/api/queue` → `limits`에서 적용 값을 확인할 수 있습니다(API 단위는 초). 설정은 다음 Windows 로그인 때에도 유지됩니다. 이미 15분 제한으로 중단된 답변은 자동 재개되지 않으므로 다시 요청하세요. 요청 접수는 즉시 반환하고 화면이 진행 상황을 조회하므로 외부 프록시의 연결 유휴 제한을 60분으로 늘릴 필요는 없습니다.
 
 ## 개발·검증
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -p "test_*.py" -v
 node test_queue_ui.cjs
+.\.venv\Scripts\python.exe -m unittest discover -s deploy/aws-relay -p test_relay.py -v
 .\.venv\Scripts\python.exe scripts/check_release.py
 .\.venv\Scripts\python.exe scripts/build_release.py
 ```
 
-테스트는 임시 DB·작업 폴더·합성 계정을 사용하며 실제 모델 추론이나 운영 서버 재시작을 요구하지 않습니다. GitHub Actions에는 Windows 테스트와 별도의 Linux relay 테스트를 넣었습니다. CI 구성의 로컬 검증과 실제 GitHub 실행은 구분합니다.
+테스트는 임시 DB·작업 폴더·합성 계정을 사용하며 실제 모델 추론이나 운영 서버 재시작을 요구하지 않습니다. 위 검사를 한 번에 실행하려면 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\check-local.ps1`을 사용합니다. Node.js가 PATH에 없다면 `-Node 'C:\path\to\node.exe'`를 지정하세요.
 
-2026-11-03 공유본 준비 시 새 환경 bootstrap, Python 테스트 94개(앱 81개·릴레이 13개), 화면 로직 검사 12개, PowerShell 구문·스킬·문서 링크·공개 파일 검사를 통과했습니다. GitHub에서의 CI 실행과 공유본을 새 PC에 설치한 뒤의 실제 모델 추론·재부팅 검증은 아직 수행하지 않았습니다.
+**GitHub Actions는 사용하지 않습니다.** 이 저장소는 Actions 설정을 비활성화했고 workflow 파일도 포함하지 않습니다. 테스트와 소스 ZIP 생성은 사용자 PC에서만 실행합니다. 기여 시에도 유료 CI, 예약 workflow, 외부 자동 실행을 추가하지 마세요. 기존 외부 서버·도메인의 이용료는 이 로컬 검증 방식과 별도입니다.
+
+2026-11-03 로컬 검증: Python 106개(앱 93개·릴레이 13개), 화면 로직 18개, 모바일 390px 삭제 확인 창, PowerShell 구문 및 공개 파일 검사를 통과했습니다. 제한 만료는 짧은 시간의 합성 요청으로 검증했으며 실제 60분 동안 추론하는 부하 검사는 수행하지 않았습니다. 새 PC 설치 후 실제 모델 추론·로그인 자동 시작·재부팅은 각 환경에서 별도로 확인해야 합니다.
 
 소스 ZIP은 `release-files.txt`에 명시한 파일만 포함합니다. 생성물은 `dist/local-ai-server-source.zip`이며 SHA-256 파일도 함께 만듭니다. 저장소 전체를 수동 압축하면 로컬 데이터가 섞일 수 있으므로 배포 스크립트를 사용하세요. 검사기는 알려진 비밀 형식과 경로를 검사하는 보조 도구이며 모든 비밀을 탐지한다는 보장은 없습니다.
 

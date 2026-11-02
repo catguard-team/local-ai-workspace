@@ -136,6 +136,62 @@ class SandboxApiTests(unittest.TestCase):
         result = self.client.post(f"/api/chats/{chat_id}/messages", json={"content": "hello", "attachments": [file_id]}, headers=HEADERS)
         self.assertEqual(result.status_code, 202, result.text)
 
+    def test_delete_chat_is_owned_and_preserves_other_history_and_upload_library(self):
+        self.login()
+        chat_id, retained = self.new_chat(), self.new_chat()
+        file_id = self.upload_text()
+        with service.db() as con:
+            con.execute("INSERT INTO messages VALUES(?,?,?,?,?,?)", (str(uuid.uuid4()), chat_id, "user", "Delete this fixture", "[]", time.time()))
+        self.login(self.other, "test_b")
+        other_chat = self.new_chat(self.other)
+        self.assertEqual(self.other.delete(f"/api/chats/{chat_id}", headers=HEADERS).status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/chats/{chat_id}").status_code, 403)
+        self.assertEqual(self.client.delete(f"/api/chats/{chat_id}", headers=HEADERS).status_code, 200)
+        self.assertEqual(self.client.get(f"/api/chats/{chat_id}").status_code, 404)
+        self.assertEqual(self.client.delete(f"/api/chats/{chat_id}", headers=HEADERS).status_code, 404)
+        self.assertEqual(self.client.get(f"/api/chats/{retained}").status_code, 200)
+        self.assertEqual(self.other.get(f"/api/chats/{other_chat}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/uploads/{file_id}").status_code, 200)
+        with service.db() as con:
+            self.assertEqual(con.execute("SELECT count(*) FROM messages WHERE chat_id=?", (chat_id,)).fetchone()[0], 0)
+
+    def test_delete_rejects_active_queued_and_cleanup_then_succeeds(self):
+        self.login()
+        active, queued = self.new_chat(), self.new_chat()
+        entered, cleaning = threading.Event(), threading.Event()
+        release = asyncio.Event()
+
+        async def fake_turn(*args):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+
+        with patch.object(service, "run_agent", fake_turn):
+            try:
+                self.client.post(f"/api/chats/{active}/messages", json={"content": "active"}, headers=HEADERS)
+                self.assertTrue(entered.wait(2))
+                self.client.post(f"/api/chats/{queued}/messages", json={"content": "queued"}, headers=HEADERS)
+                for chat_id in (active, queued):
+                    self.assertEqual(self.client.delete(f"/api/chats/{chat_id}", headers=HEADERS).status_code, 409)
+                self.client.post(f"/api/chats/{queued}/cancel", headers=HEADERS)
+                self.assertEqual(self.client.delete(f"/api/chats/{queued}", headers=HEADERS).status_code, 200)
+                self.client.post(f"/api/chats/{active}/cancel", headers=HEADERS)
+                self.assertTrue(cleaning.wait(2))
+                self.assertEqual(self.client.delete(f"/api/chats/{active}", headers=HEADERS).status_code, 409)
+            finally:
+                self.client.portal.call(release.set)
+                self.wait_idle(active)
+            self.assertEqual(self.client.delete(f"/api/chats/{active}", headers=HEADERS).status_code, 200)
+
+    def test_queue_exposes_effective_time_limits(self):
+        self.login()
+        limits = self.client.get("/api/queue").json()["limits"]
+        self.assertEqual(limits["max_runtime_seconds"], service.MAX_REQUEST_SECONDS)
+        self.assertEqual(limits["max_wait_seconds"], service.MAX_QUEUE_WAIT_SECONDS)
+
     def test_unknown_execution_parameters_rejected(self):
         self.login()
         chat_id = self.new_chat()
@@ -486,11 +542,11 @@ class SandboxApiTests(unittest.TestCase):
             self.assertTrue(started.wait(2))
             self.assertEqual(self.client.post(f"/api/chats/{expired}/messages", json={"content": "expire"}, headers=HEADERS).status_code, 202)
             expired_result = self.wait_idle(expired)
-            self.assertIn("30분", expired_result["error"])
+            self.assertIn(f"{service.MAX_QUEUE_WAIT_SECONDS / 60:g}분", expired_result["error"])
             queue.limits["max_wait_seconds"] = 5
             self.assertEqual(self.client.post(f"/api/chats/{next_chat}/messages", json={"content": "next"}, headers=HEADERS).status_code, 202)
             timed_out = self.wait_idle(active)
-            self.assertIn("15분", timed_out["error"])
+            self.assertIn(f"{service.MAX_REQUEST_SECONDS / 60:g}분", timed_out["error"])
             self.assertIn("다시", timed_out["messages"][-1]["content"])
             self.assertEqual(self.wait_idle(next_chat)["messages"][-1]["content"], "Finished next")
 

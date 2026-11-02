@@ -27,7 +27,7 @@ git remote add origin https://github.com/YOUR_ACCOUNT/YOUR_REPOSITORY.git
 git push -u origin main
 ```
 
-커밋 작성자 이름과 이메일은 본인의 Git 설정을 사용합니다. 이메일 공개를 원하지 않으면 GitHub 계정에서 제공하는 비공개 noreply 주소를 설정하세요. 기존 `origin`이 있으면 새로 추가하지 말고 목적지를 확인합니다. 업로드 후 GitHub Actions 결과를 확인하세요.
+커밋 작성자 이름과 이메일은 본인의 Git 설정을 사용합니다. 이메일 공개를 원하지 않으면 GitHub 계정에서 제공하는 비공개 noreply 주소를 설정하세요. 기존 `origin`이 있으면 새로 추가하지 말고 목적지를 확인합니다. 업로드 전에 `scripts/check-local.ps1`로 로컬 검증을 완료하세요. GitHub Actions는 비활성화 상태로 유지하며 workflow를 추가하지 않습니다.
 
 ## ZIP 공유
 

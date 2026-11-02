@@ -33,6 +33,7 @@ from sandbox_fs import SafeWorkspace, SandboxViolation
 from local_urls import public_url
 from vpn_access import load_vpn_config, load_vpn_public_config, verified_vpn_peer, verified_public_client
 from inference_queue import FifoQueue, AdmissionError
+from inference_settings import load_limits
 
 BASE = Path(__file__).resolve().parent
 ROOT = BASE / "agent"
@@ -47,8 +48,9 @@ MAX_TEXT = 60000
 workspace = SafeWorkspace(ROOT)
 MAX_QUEUE_WAITING = 8
 MAX_USER_PENDING = 2
-MAX_REQUEST_SECONDS = 900
-MAX_QUEUE_WAIT_SECONDS = 1800
+_limits = load_limits()
+MAX_REQUEST_SECONDS = _limits["max_runtime_seconds"]
+MAX_QUEUE_WAIT_SECONDS = _limits["max_wait_seconds"]
 jobs: dict[str, asyncio.Future] = {}
 inference_queue: FifoQueue | None = None
 login_attempts: dict[str, deque] = defaultdict(deque)
@@ -309,8 +311,8 @@ def persist_queue_state(entry):
 def finish_queue_request(entry, reason, error):
     messages = {
         "cancelled": "요청을 취소했습니다.",
-        "timeout": "응답 처리 시간이 15분을 초과해 중지했습니다. 다시 요청해 주세요.",
-        "expired": "대기 시간이 30분을 초과해 요청을 취소했습니다. 다시 보내 주세요.",
+        "timeout": f"응답 처리 시간이 {MAX_REQUEST_SECONDS / 60:g}분을 초과해 중지했습니다. 다시 요청해 주세요.",
+        "expired": f"대기 시간이 {MAX_QUEUE_WAIT_SECONDS / 60:g}분을 초과해 요청을 취소했습니다. 다시 보내 주세요.",
         "interrupted": "서버가 재시작되거나 종료되어 요청이 중단되었습니다. 다시 보내 주세요.",
         "error": "LM Studio 응답을 완료하지 못했습니다. 모델 실행 상태를 확인하고 다시 시도해 주세요."
     }
@@ -374,6 +376,20 @@ async def get_chat(chat_id: str, user=Depends(current_user)):
     result.pop("request_message_id", None)
     result.update(queue_status(chat_id))
     return result
+
+
+@app.delete("/api/chats/{chat_id}")
+async def delete_chat(chat_id: str, user=Depends(current_user)):
+    own_chat(chat_id, user)
+    if queue_status(chat_id)["running"] or (chat_id in jobs and not jobs[chat_id].done()):
+        raise HTTPException(409, "대기 취소 또는 답변 중지를 누르고 처리가 끝난 뒤 삭제해 주세요.")
+    # No await between the active-request check and transaction. A new turn
+    # cannot start while its history is being deleted on this event loop.
+    with db() as con:
+        con.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
+        con.execute("DELETE FROM chats WHERE id=? AND user_id=?", (chat_id, user["id"]))
+    # Uploads are an account library shared by multiple conversations.
+    return {"deleted": chat_id}
 
 
 def own_upload(file_id, user):
@@ -648,7 +664,7 @@ async def model_turn(messages, on_chunk, *, use_tools=False):
     payload = {"model": MODEL, "messages": messages, "temperature": 0.3, "max_tokens": 1536, "stream": True}
     if use_tools:
         payload.update(tools=TOOLS, tool_choice="auto")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(900, connect=10), trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(MAX_REQUEST_SECONDS + 30, connect=10), trust_env=False) as client:
         async with client.stream("POST", MODEL_URL, json=payload) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():

@@ -1,0 +1,4 @@
+{
+  "max_response_minutes": 60,
+  "max_queue_wait_minutes": 120
+}
