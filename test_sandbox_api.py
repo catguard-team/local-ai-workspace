@@ -7,6 +7,8 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -188,6 +190,48 @@ class SandboxApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["mime"], "image/jpeg")
         self.assertEqual(self.client.get("/api/uploads/not-a-uuid").status_code, 400)
+
+    def pdf_fixture(self, encrypted=False):
+        from pypdf import PdfWriter
+        from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=300, height=200)
+        font = DictionaryObject({NameObject('/Type'): NameObject('/Font'), NameObject('/Subtype'): NameObject('/Type1'), NameObject('/BaseFont'): NameObject('/Helvetica')})
+        page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): DictionaryObject({NameObject('/F1'): font})})
+        stream = DecodedStreamObject()
+        stream.set_data(b'BT /F1 12 Tf 20 100 Td (Security regression sample) Tj ET')
+        page[NameObject('/Contents')] = stream
+        if encrypted:
+            writer.encrypt('synthetic-fixture-only')
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        return buffer.getvalue()
+
+    def test_patched_pdf_upload_extracts_text_and_preserves_download(self):
+        self.login()
+        data = self.pdf_fixture()
+        response = self.client.post('/api/uploads', files={'file': ('fixture.pdf', data, 'application/pdf')}, headers=HEADERS)
+        self.assertEqual(response.status_code, 200, response.text)
+        file_id = response.json()['id']
+        with service.db() as con:
+            text = con.execute('SELECT extracted FROM uploads WHERE id=?', (file_id,)).fetchone()[0]
+        self.assertIn('Security regression sample', text)
+        self.assertEqual(self.client.get('/api/uploads/' + file_id).content, data)
+
+    def test_encrypted_pdf_is_rejected_without_persisting_upload(self):
+        self.login()
+        response = self.client.post('/api/uploads', files={'file': ('encrypted.pdf', self.pdf_fixture(True), 'application/pdf')}, headers=HEADERS)
+        self.assertEqual(response.status_code, 400)
+        with service.db() as con:
+            self.assertEqual(con.execute('SELECT COUNT(*) FROM uploads').fetchone()[0], 0)
+
+    def test_truncated_xref_trailer_terminates_with_parse_error(self):
+        # Minimal EOF fixture from upstream GHSA-5849-834g-hvw5 / PR #4289.
+        # Child timeout prevents an accidental dependency regression hanging CI.
+        payload = b'%PDF-1.4\nstartxref\n28\n%%EOF\nxref\n1 0\naaa'
+        code = "from io import BytesIO\nimport sys\nfrom pypdf import PdfReader\nfrom pypdf.errors import PdfReadError\ntry:\n PdfReader(BytesIO(sys.stdin.buffer.read()))\nexcept PdfReadError:\n sys.exit(0)\nsys.exit(2)"
+        result = subprocess.run([sys.executable, '-I', '-c', code], input=payload, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode('utf-8', errors='replace'))
 
     def test_declared_oversize_request_is_rejected(self):
         self.login()

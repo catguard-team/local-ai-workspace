@@ -56,3 +56,4 @@ vendor/marked.umd.js
 vpn_access.py
 write-access.py
 실행.cmd
+docs/SECURITY-UPDATES.md
