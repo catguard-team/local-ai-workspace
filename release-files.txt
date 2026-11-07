@@ -29,6 +29,7 @@ install-startup.ps1
 launch-computer.py
 launch-gateway.py
 local_urls.py
+open_browser.py
 release-files.txt
 requirements-lock.txt
 requirements.txt
@@ -44,6 +45,7 @@ start.ps1
 test_account_setup.py
 test_inference_queue.py
 test_local_urls.py
+test_open_browser.py
 test_queue_ui.cjs
 test_release.py
 test_sandbox_api.py
