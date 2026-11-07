@@ -20,6 +20,7 @@ import sqlite3
 import time
 import uuid
 import zipfile
+import server_control
 from urllib.parse import quote, urlsplit
 from typing import Literal
 
@@ -96,9 +97,13 @@ async def lifespan(app):
                       on_state=persist_queue_state, on_finish=finish_queue_request)
     inference_queue = queue
     app.state.shutdown_requested = False
+    stop_watcher = asyncio.create_task(server_control.watch_stop_request(queue, app))
     try:
         yield
     finally:
+        if not stop_watcher.done():
+            stop_watcher.cancel()
+        await asyncio.gather(stop_watcher, return_exceptions=True)
         await queue.shutdown()
         if inference_queue is queue:
             inference_queue = None
@@ -396,6 +401,7 @@ async def shutdown_server(body: ShutdownRequest, request: Request, user=Depends(
     if callback is None:
         raise HTTPException(503, "이 실행 방식은 웹 종료를 지원하지 않습니다. start.ps1로 실행해 주세요.")
     queue.closed = True
+    server_control.write_status("stopping")
     request.app.state.shutdown_requested = True
     # Signal Uvicorn after the acceptance response is sent. Lifespan cleanup
     # completes before the fixed gateway / LM Studio shutdown actions run.
