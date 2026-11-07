@@ -62,6 +62,10 @@ class SandboxApiTests(unittest.TestCase):
             patch.object(service, "DB", database),
             patch.object(service, "UPLOADS", state / "uploads"),
             patch.object(service, "ROOT", agent),
+            patch.object(service, "SETTINGS_PATH", state / "inference-settings.json"),
+            patch.object(service, "MAX_REQUEST_SECONDS", 3600),
+            patch.object(service, "MAX_QUEUE_WAIT_SECONDS", 7200),
+            patch.object(service.app.state, "request_shutdown", Mock(), create=True),
             patch.object(service, "workspace", SafeWorkspace(agent)),
             patch.object(service, "jobs", {}),
             patch.object(service, "login_attempts", defaultdict(deque)),
@@ -71,7 +75,7 @@ class SandboxApiTests(unittest.TestCase):
         ]
         for patcher in self.patchers:
             patcher.start()
-        self.client = TestClient(service.app, base_url="http://127.0.0.1")
+        self.client = TestClient(service.app, base_url="http://127.0.0.1", client=("127.0.0.1", 42000))
         self.client.__enter__()
         self.other = TestClient(service.app, base_url="http://127.0.0.1")
 
@@ -191,6 +195,79 @@ class SandboxApiTests(unittest.TestCase):
         limits = self.client.get("/api/queue").json()["limits"]
         self.assertEqual(limits["max_runtime_seconds"], service.MAX_REQUEST_SECONDS)
         self.assertEqual(limits["max_wait_seconds"], service.MAX_QUEUE_WAIT_SECONDS)
+
+    def test_web_settings_persist_apply_and_require_authentication(self):
+        values = {"max_response_minutes": 90, "max_queue_wait_minutes": 180}
+        self.assertEqual(self.client.get("/api/settings").status_code, 401)
+        self.assertEqual(self.client.put("/api/settings", json=values, headers=HEADERS).status_code, 401)
+        self.login()
+        self.assertEqual(self.client.put("/api/settings", json=values).status_code, 403)
+        result = self.client.put("/api/settings", json=values, headers=HEADERS)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(json.loads(service.SETTINGS_PATH.read_text()), values)
+        self.assertEqual(self.client.get("/api/queue").json()["limits"]["max_runtime_seconds"], 5400)
+        self.login(self.other, "test_b")
+        self.assertEqual(self.other.get("/api/settings").json()["max_response_minutes"], 90)
+        self.assertEqual(service.load_limits(service.SETTINGS_PATH)["max_wait_seconds"], 10800)
+        old = service.SETTINGS_PATH.read_bytes()
+        for bad in ({"max_response_minutes": True, "max_queue_wait_minutes": 120},
+                    {"max_response_minutes": 0, "max_queue_wait_minutes": 120},
+                    {"max_response_minutes": 90, "max_queue_wait_minutes": 60},
+                    {"max_response_minutes": 90, "max_queue_wait_minutes": 1441},
+                    {**values, "shell": "not allowed"}):
+            self.assertEqual(self.client.put("/api/settings", json=bad, headers=HEADERS).status_code, 422)
+        with patch.object(service, "save_settings", side_effect=PermissionError("Synthetic write failure")):
+            self.assertEqual(self.client.put("/api/settings", json={"max_response_minutes": 60, "max_queue_wait_minutes": 120}, headers=HEADERS).status_code, 409)
+        self.assertEqual(service.SETTINGS_PATH.read_bytes(), old)
+        self.assertEqual(service.inference_queue.limits["max_runtime_seconds"], 5400)
+
+    def test_shutdown_requires_authenticated_local_connection_and_confirmation(self):
+        local = TestClient(service.app, base_url="http://127.0.0.1:8787", client=("127.0.0.1", 42000))
+        remote = TestClient(service.app, base_url="http://127.0.0.1:8787", client=("203.0.113.10", 42001))
+        try:
+            body = {"confirmed": True}
+            self.assertEqual(local.post("/api/server/shutdown", json=body, headers=HEADERS).status_code, 401)
+            self.login(local)
+            self.login(remote)
+            self.assertTrue(local.get("/api/settings").json()["can_shutdown"])
+            self.assertFalse(remote.get("/api/settings").json()["can_shutdown"])
+            self.assertEqual(remote.post("/api/server/shutdown", json=body, headers=HEADERS).status_code, 403)
+            self.assertEqual(local.post("/api/server/shutdown", json=body).status_code, 403)
+            self.assertEqual(local.post("/api/server/shutdown", json={"confirmed": False}, headers=HEADERS).status_code, 422)
+            # Public proxy host cannot turn its loopback transport into local authority.
+            self.assertEqual(local.post("/api/server/shutdown", json=body, headers={**HEADERS, "host": "ai.example.com"}).status_code, 403)
+            response = local.post("/api/server/shutdown", json=body, headers=HEADERS)
+            self.assertEqual(response.status_code, 200, response.text)
+            service.app.state.request_shutdown.assert_called_once()
+            self.assertTrue(service.inference_queue.closed)
+            self.assertEqual(local.put("/api/settings", json={"max_response_minutes": 60,"max_queue_wait_minutes": 120}, headers=HEADERS).status_code, 503)
+        finally:
+            local.close()
+            remote.close()
+
+    def test_shutdown_refuses_pending_work_without_interrupting_it(self):
+        # Use the entered client's persistent event loop. An unentered client
+        # closes its per-request loop and cancels synthetic work immediately.
+        local = self.client
+        self.login(local)
+        chat_id = self.new_chat(local)
+        gate = asyncio.Event()
+        entered = threading.Event()
+        async def turn(*args):
+            entered.set()
+            await gate.wait()
+        try:
+            with patch.object(service, "run_agent", turn):
+                local.post(f"/api/chats/{chat_id}/messages", json={"content":"fixture"}, headers=HEADERS)
+                self.assertTrue(entered.wait(2))
+                response = local.post("/api/server/shutdown", json={"confirmed":True}, headers=HEADERS)
+                self.assertEqual(response.status_code, 409)
+                self.assertFalse(service.inference_queue.closed)
+                service.app.state.request_shutdown.assert_not_called()
+                self.client.portal.call(gate.set)
+                self.wait_idle(chat_id, {"cookie":f"{service.COOKIE}={local.cookies.get(service.COOKIE)}"})
+        finally:
+            self.client.portal.call(gate.set)
 
     def test_unknown_execution_parameters_rejected(self):
         self.login()
@@ -542,11 +619,11 @@ class SandboxApiTests(unittest.TestCase):
             self.assertTrue(started.wait(2))
             self.assertEqual(self.client.post(f"/api/chats/{expired}/messages", json={"content": "expire"}, headers=HEADERS).status_code, 202)
             expired_result = self.wait_idle(expired)
-            self.assertIn(f"{service.MAX_QUEUE_WAIT_SECONDS / 60:g}분", expired_result["error"])
+            self.assertIn(f"{.15 / 60:g}분", expired_result["error"])
             queue.limits["max_wait_seconds"] = 5
             self.assertEqual(self.client.post(f"/api/chats/{next_chat}/messages", json={"content": "next"}, headers=HEADERS).status_code, 202)
             timed_out = self.wait_idle(active)
-            self.assertIn(f"{service.MAX_REQUEST_SECONDS / 60:g}분", timed_out["error"])
+            self.assertIn(f"{.5 / 60:g}분", timed_out["error"])
             self.assertIn("다시", timed_out["messages"][-1]["content"])
             self.assertEqual(self.wait_idle(next_chat)["messages"][-1]["content"], "Finished next")
 

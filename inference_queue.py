@@ -4,10 +4,12 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+from contextvars import ContextVar
 import logging
 from typing import Awaitable, Callable
 
 LOG = logging.getLogger(__name__)
+request_runtime_seconds = ContextVar("request_runtime_seconds", default=None)
 
 
 class AdmissionError(Exception):
@@ -23,6 +25,8 @@ class Entry:
     operation: Callable[[], Awaitable]
     completion: asyncio.Future
     enqueued_at: float
+    max_runtime_seconds: float
+    max_wait_seconds: float
     state: str = "queued"
     reason: str | None = None
     work: asyncio.Task | None = None
@@ -58,13 +62,14 @@ class FifoQueue:
     def submit(self, key, user_id, operation):
         self.check_available(key, user_id)
         loop = asyncio.get_running_loop()
-        entry = Entry(key, user_id, operation, loop.create_future(), loop.time())
+        entry = Entry(key, user_id, operation, loop.create_future(), loop.time(),
+                      self.limits["max_runtime_seconds"], self.limits["max_wait_seconds"])
         self.entries[key] = entry
         if self.active is None:
             self._start(entry)
         else:
             self.waiting.append(key)
-            entry.wait_timer = loop.call_later(self.limits["max_wait_seconds"], self._expire, entry)
+            entry.wait_timer = loop.call_later(entry.max_wait_seconds, self._expire, entry)
             self._notify(self.on_state, entry)
         return entry
 
@@ -96,12 +101,13 @@ class FifoQueue:
         entry.state = "running"
         self._notify(self.on_state, entry)
         loop = asyncio.get_running_loop()
-        entry.run_timer = loop.call_later(self.limits["max_runtime_seconds"], self.cancel, entry.key, "timeout")
+        entry.run_timer = loop.call_later(entry.max_runtime_seconds, self.cancel, entry.key, "timeout")
         # This wrapper is never canceled: it waits for operation cleanup before
         # releasing the shared slot, even when cancelled before its first step.
         entry.runner = asyncio.create_task(self._execute(entry))
 
     async def _execute(self, entry):
+        token = request_runtime_seconds.set(entry.max_runtime_seconds)
         error = None
         reason = "completed"
         try:
@@ -113,6 +119,7 @@ class FifoQueue:
         except Exception as exc:
             reason, error = "error", exc
         finally:
+            request_runtime_seconds.reset(token)
             self._finish(entry, entry.reason or reason, error)
 
     def _expire(self, entry):
@@ -152,7 +159,7 @@ class FifoQueue:
         if self.active is None and not self.closed:
             while self.waiting:
                 next_entry = self.entries[self.waiting.popleft()]
-                if asyncio.get_running_loop().time() - next_entry.enqueued_at >= self.limits["max_wait_seconds"]:
+                if asyncio.get_running_loop().time() - next_entry.enqueued_at >= next_entry.max_wait_seconds:
                     self._finish(next_entry, "expired", None)
                     # _finish may already have promoted the following entry.
                     if self.active is not None:

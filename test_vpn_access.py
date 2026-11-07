@@ -212,6 +212,16 @@ class VpnLoginTests(unittest.TestCase):
             self.assertIn("; secure", response.headers["set-cookie"].lower())
             self.assertEqual(public.get("/api/me").status_code, 200)
 
+    def test_verified_remote_proxy_cannot_use_local_shutdown(self):
+        headers = gateway.proxy_headers({**RELAY_HEADERS, "x-sandbox-request": "1"}, CONFIG["bind_ip"], PUBLIC_CONFIG["relay_peer"], CONFIG, public_config=PUBLIC_CONFIG)
+        with TestClient(service.app, base_url="http://ai.example.com", client=("127.0.0.1", 12345)) as public:
+            login = public.post("/api/login", json={"username":"vpn_test","password":"vpn-fixture-password"}, headers=headers)
+            self.assertEqual(login.status_code, 200)
+            authenticated = {**headers, "cookie":login.headers["set-cookie"].split(";",1)[0]}
+            self.assertFalse(public.get("/api/settings", headers=authenticated).json()["can_shutdown"])
+            self.assertEqual(public.post("/api/server/shutdown", json={"confirmed":True}, headers=authenticated).status_code, 403)
+            self.assertFalse(service.inference_queue.closed)
+
     def test_https_relay_over_private_http_keeps_secure_cookie(self):
         headers = gateway.proxy_headers({**RELAY_HEADERS, "x-sandbox-request": "1"}, CONFIG["bind_ip"], PUBLIC_CONFIG["relay_peer"], CONFIG, vpn_only=True, public_config=PUBLIC_CONFIG)
         with TestClient(service.app, base_url="http://ai.example.com", client=("127.0.0.1", 12345)) as public:

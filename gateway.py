@@ -11,6 +11,7 @@ from vpn_access import (INTERNAL_PREFIX, TOKEN_HEADER, PEER_HEADER, RELAY_HEADER
                         load_vpn_config, load_vpn_public_config, permitted_peer, vpn_authority,
                         canonical_client_ip, public_client_token)
 from local_urls import vpn_only_access
+from server_control import GATEWAY_STOP
 
 HOP = {'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'content-length'}
 UNTRUSTED_PROXY = {'cf-connecting-ip', 'x-forwarded-for', 'x-real-ip', 'forwarded'}
@@ -128,7 +129,8 @@ async def run_server():
     try:
         await web.TCPSite(runner, host='127.0.0.1', port=8787).start()
         vpn_task = asyncio.create_task(bind_vpn_when_ready(runner, app['vpn_config']))
-        await asyncio.Event().wait()
+        while not GATEWAY_STOP.exists():
+            await asyncio.sleep(.5)
     finally:
         if vpn_task:
             vpn_task.cancel()

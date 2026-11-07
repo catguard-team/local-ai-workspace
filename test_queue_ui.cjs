@@ -31,7 +31,7 @@ function harness() {
   const document={hidden:false,getElementById:get,querySelectorAll:()=>[],createElement:()=>new Element(),addEventListener:(name,fn)=>{documentEvents[name]=fn;},documentElement:{style:{setProperty(){},removeProperty(){}}},body:new Element()};
   const context=vm.createContext({console,URL,URLSearchParams,Headers,FormData,Map,Set,document,navigator:{},history:{replaceState(){}},window:{location:{search:'',href:'http://localhost/'},innerWidth:1280,addEventListener(){}},performance:{now:()=>now},Date:class extends Date{static now(){return now;}},setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
   vm.runInContext(source.replace('api("/api/me").then(enterApp).catch(()=>showLogin());',''),context);
-  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin,loadChats,openDeleteChat})',context);
+  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin,loadChats,openDeleteChat,openSettings})',context);
   ui.state.me={username:'test'};
   context.mockApi=async route=>{calls.push(route);return route==='/api/queue'?{server_busy:false,queue_waiting:0}:{id:ui.state.chat,messages:[],mode:'chat',running:false,request_state:'idle'};};
   vm.runInContext('api=(...args)=>globalThis.mockApi(...args);',context);
@@ -94,6 +94,32 @@ async function main(){
   await test('queue help displays the effective configured minutes',()=>{
     const h=harness();h.ui.renderQueue({limits:{max_runtime_seconds:3600,max_wait_seconds:7200}});assert.match(h.get('queue-help').textContent,/응답 최대 60분 · 대기 최대 120분/);
     h.ui.renderQueue({limits:{max_runtime_seconds:5400,max_wait_seconds:10800}});assert.match(h.get('queue-help').textContent,/90분 · 대기 최대 180분/);
+  });
+  await test('web settings load shared limits and hide remote shutdown authority',async()=>{
+    const h=harness();h.context.mockApi=async()=>({max_response_minutes:60,max_queue_wait_minutes:120,can_shutdown:false});
+    await h.ui.openSettings();assert.equal(h.get('settings-dialog').open,true);assert.equal(h.get('response-minutes').value,60);assert.equal(h.get('shutdown-open').disabled,true);assert.match(h.get('shutdown-help').textContent,/서버 PC/);
+  });
+  await test('valid settings are saved without clearing the current draft',async()=>{
+    const h=harness();h.get('response-minutes').value='90';h.get('wait-minutes').value='180';h.get('message-input').value='keep draft';h.ui.state.chat='current';
+    h.context.mockApi=async(route,options)=>{assert.equal(route,'/api/settings');assert.equal(options.method,'PUT');assert.equal(options.body.max_response_minutes,90);return options.body;};
+    await h.get('settings-form').listeners.submit({preventDefault(){}});assert.equal(h.get('settings-success').hidden,false);assert.match(h.get('settings-success').textContent,/90분/);assert.equal(h.get('message-input').value,'keep draft');assert.equal(h.ui.state.chat,'current');
+  });
+  await test('invalid limits never send a settings request',async()=>{
+    const h=harness();h.context.mockApi=async()=>{throw new Error('must not call');};h.get('response-minutes').value='90';h.get('wait-minutes').value='60';
+    await h.get('settings-form').listeners.submit({preventDefault(){}});assert.match(h.get('settings-error').textContent,/대기 제한/);assert.equal(h.ui.state.settingsBusy,false);
+  });
+  await test('settings write failure keeps inputs and leaves a retry control',async()=>{
+    const h=harness();h.get('response-minutes').value='90';h.get('wait-minutes').value='180';h.context.mockApi=async()=>{throw new Error('write failed');};
+    await h.get('settings-form').listeners.submit({preventDefault(){}});assert.equal(h.get('response-minutes').value,'90');assert.match(h.get('settings-error').textContent,/write failed/);assert.equal(h.get('settings-save').disabled,false);
+  });
+  await test('shutdown requires a separate explicit confirmation and stops polling on acceptance',async()=>{
+    const h=harness();h.ui.state.canShutdown=true;let requests=0;h.context.mockApi=async(route,options)=>{requests++;assert.equal(route,'/api/server/shutdown');assert.equal(options.body.confirmed,true);return{status:'stopping'};};
+    h.get('shutdown-open').listeners.click();assert.equal(requests,0);assert.equal(h.get('shutdown-dialog').open,true);
+    h.get('shutdown-cancel').listeners.click();assert.equal(requests,0);assert.equal(h.get('shutdown-dialog').open,false);
+    h.get('shutdown-open').listeners.click();h.ui.scheduleLivePoll();await h.get('shutdown-confirm').listeners.click();assert.equal(requests,1);assert.equal(h.get('stopped-dialog').open,true);assert.equal(h.ui.state.serverStopped,true);assert.equal(h.timers.size,0);h.ui.scheduleLivePoll();assert.equal(h.timers.size,0);await h.ui.refreshLiveState();assert.equal(requests,1);
+  });
+  await test('busy shutdown response keeps the app usable',async()=>{
+    const h=harness();h.ui.state.canShutdown=true;h.context.mockApi=async()=>{throw new Error('진행 중 요청을 완료');};h.get('shutdown-open').listeners.click();await h.get('shutdown-confirm').listeners.click();assert.equal(h.ui.state.serverStopped,false);assert.match(h.get('shutdown-error').textContent,/진행 중/);assert.equal(h.get('shutdown-confirm').disabled,false);
   });
   console.log(`${count} queue UI checks passed.`);
 }

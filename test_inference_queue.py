@@ -43,6 +43,26 @@ class InferenceQueueTests(unittest.IsolatedAsyncioTestCase):
             queue.check_available(key, user)
         self.assertEqual(error.exception.reason, reason)
 
+    async def test_hot_settings_keep_existing_request_deadlines_and_model_timeout(self):
+        from inference_queue import request_runtime_seconds
+        queue = self.queue(max_runtime_seconds=2, max_wait_seconds=3)
+        gate = self.gate()
+        observed = []
+        async def work():
+            observed.append(request_runtime_seconds.get())
+            await gate.wait()
+        first = queue.submit("first", "user_a", work)
+        second = queue.submit("second", "user_b", work)
+        queue.limits.update(max_runtime_seconds=5, max_wait_seconds=6)
+        third = queue.submit("third", "user_c", work)
+        self.assertEqual((first.max_runtime_seconds, second.max_wait_seconds), (2, 3))
+        self.assertEqual((third.max_runtime_seconds, third.max_wait_seconds), (5, 6))
+        gate.set()
+        for entry in (first, second, third):
+            self.assertEqual(await asyncio.wait_for(entry.completion, 2), "completed")
+        self.assertEqual(observed, [2, 2, 5])
+        self.assertIsNone(request_runtime_seconds.get())
+
     async def test_fifo_across_accounts_holds_one_active_slot(self):
         queue = self.queue()
         order, concurrency = [], [0, 0]

@@ -60,3 +60,6 @@ inference_settings.py
 test_inference_settings.py
 config/inference-settings.json.example
 scripts/check-local.ps1
+server_control.py
+test_server_control.py
+서버관리.cmd

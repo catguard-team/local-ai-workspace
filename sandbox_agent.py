@@ -26,14 +26,15 @@ from typing import Literal
 import bcrypt
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Depends
 from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
+from starlette.background import BackgroundTask
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from sandbox_fs import SafeWorkspace, SandboxViolation
 from local_urls import public_url
 from vpn_access import load_vpn_config, load_vpn_public_config, verified_vpn_peer, verified_public_client
-from inference_queue import FifoQueue, AdmissionError
-from inference_settings import load_limits
+from inference_queue import FifoQueue, AdmissionError, request_runtime_seconds
+from inference_settings import load_limits, save_settings, SETTINGS_PATH
 
 BASE = Path(__file__).resolve().parent
 ROOT = BASE / "agent"
@@ -94,6 +95,7 @@ async def lifespan(app):
                       max_runtime_seconds=MAX_REQUEST_SECONDS, max_wait_seconds=MAX_QUEUE_WAIT_SECONDS,
                       on_state=persist_queue_state, on_finish=finish_queue_request)
     inference_queue = queue
+    app.state.shutdown_requested = False
     try:
         yield
     finally:
@@ -311,8 +313,8 @@ def persist_queue_state(entry):
 def finish_queue_request(entry, reason, error):
     messages = {
         "cancelled": "요청을 취소했습니다.",
-        "timeout": f"응답 처리 시간이 {MAX_REQUEST_SECONDS / 60:g}분을 초과해 중지했습니다. 다시 요청해 주세요.",
-        "expired": f"대기 시간이 {MAX_QUEUE_WAIT_SECONDS / 60:g}분을 초과해 요청을 취소했습니다. 다시 보내 주세요.",
+        "timeout": f"응답 처리 시간이 {entry.max_runtime_seconds / 60:g}분을 초과해 중지했습니다. 다시 요청해 주세요.",
+        "expired": f"대기 시간이 {entry.max_wait_seconds / 60:g}분을 초과해 요청을 취소했습니다. 다시 보내 주세요.",
         "interrupted": "서버가 재시작되거나 종료되어 요청이 중단되었습니다. 다시 보내 주세요.",
         "error": "LM Studio 응답을 완료하지 못했습니다. 모델 실행 상태를 확인하고 다시 시도해 주세요."
     }
@@ -332,6 +334,72 @@ async def get_queue(user=Depends(current_user)):
     if inference_queue is None:
         raise HTTPException(503, "요청 대기열을 준비하고 있습니다. 잠시 후 다시 시도해 주세요.")
     return inference_queue.summary(user["id"])
+
+
+def local_control_allowed(request):
+    return (request.client is not None and request.client.host in ("127.0.0.1", "::1")
+            and request.url.hostname in ("127.0.0.1", "localhost", "::1")
+            and not getattr(request.state, "vpn_peer", None)
+            and not getattr(request.state, "public_client", None))
+
+
+def settings_view(request):
+    queue = inference_queue
+    if queue is None:
+        raise HTTPException(503, "서버를 준비하고 있습니다.")
+    return {"max_response_minutes": queue.limits["max_runtime_seconds"] // 60,
+            "max_queue_wait_minutes": queue.limits["max_wait_seconds"] // 60,
+            "can_shutdown": local_control_allowed(request),
+            "shutting_down": queue.closed}
+
+
+@app.get("/api/settings")
+async def get_settings(request: Request, user=Depends(current_user)):
+    return settings_view(request)
+
+
+class TimeSettings(StrictBody):
+    max_response_minutes: int = Field(strict=True, ge=1, le=1440)
+    max_queue_wait_minutes: int = Field(strict=True, ge=1, le=1440)
+
+
+@app.put("/api/settings")
+async def update_settings(body: TimeSettings, request: Request, user=Depends(current_user)):
+    global MAX_REQUEST_SECONDS, MAX_QUEUE_WAIT_SECONDS
+    queue = inference_queue
+    if queue is None or queue.closed:
+        raise HTTPException(503, "서버가 종료 중입니다.")
+    if body.max_queue_wait_minutes < body.max_response_minutes:
+        raise HTTPException(422, "대기 제한은 응답 제한 이상이어야 합니다.")
+    # Persist first. On a write failure, keep the previous live limits intact.
+    limits = save_settings(body.model_dump(), SETTINGS_PATH)
+    queue.limits.update(limits)
+    MAX_REQUEST_SECONDS = limits["max_runtime_seconds"]
+    MAX_QUEUE_WAIT_SECONDS = limits["max_wait_seconds"]
+    return settings_view(request)
+
+
+class ShutdownRequest(StrictBody):
+    confirmed: Literal[True]
+
+
+@app.post("/api/server/shutdown")
+async def shutdown_server(body: ShutdownRequest, request: Request, user=Depends(current_user)):
+    if not local_control_allowed(request):
+        raise HTTPException(403, "서버 PC에서 http://127.0.0.1:8787 에 접속해 종료해 주세요.")
+    queue = inference_queue
+    if queue is None:
+        raise HTTPException(503, "서버를 준비하고 있습니다.")
+    if queue.entries:
+        raise HTTPException(409, "진행 중·대기 중 요청을 완료하거나 취소한 뒤 서버를 종료해 주세요.")
+    callback = getattr(request.app.state, "request_shutdown", None)
+    if callback is None:
+        raise HTTPException(503, "이 실행 방식은 웹 종료를 지원하지 않습니다. start.ps1로 실행해 주세요.")
+    queue.closed = True
+    request.app.state.shutdown_requested = True
+    # Signal Uvicorn after the acceptance response is sent. Lifespan cleanup
+    # completes before the fixed gateway / LM Studio shutdown actions run.
+    return JSONResponse({"status": "stopping"}, background=BackgroundTask(callback))
 
 
 @app.get("/api/chats")
@@ -664,7 +732,7 @@ async def model_turn(messages, on_chunk, *, use_tools=False):
     payload = {"model": MODEL, "messages": messages, "temperature": 0.3, "max_tokens": 1536, "stream": True}
     if use_tools:
         payload.update(tools=TOOLS, tool_choice="auto")
-    async with httpx.AsyncClient(timeout=httpx.Timeout(MAX_REQUEST_SECONDS + 30, connect=10), trust_env=False) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout((request_runtime_seconds.get() or MAX_REQUEST_SECONDS) + 30, connect=10), trust_env=False) as client:
         async with client.stream("POST", MODEL_URL, json=payload) as response:
             response.raise_for_status()
             async for line in response.aiter_lines():
@@ -756,4 +824,9 @@ async def run_agent(chat_id, assistant_id, user):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8081, access_log=False, proxy_headers=False)
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8081, access_log=False, proxy_headers=False))
+    app.state.request_shutdown = lambda: setattr(server, "should_exit", True)
+    server.run()
+    if getattr(app.state, "shutdown_requested", False):
+        from server_control import stop_local_services
+        stop_local_services()

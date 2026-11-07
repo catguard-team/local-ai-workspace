@@ -99,6 +99,8 @@ try {
     try { $startupLockHeld = $startupMutex.WaitOne(0) }
     catch [System.Threading.AbandonedMutexException] { $startupLockHeld = $true }
     if (-not $startupLockHeld) { Write-Output 'Local AI startup is already running.'; return }
+    $controlResult = Invoke-PythonCommand '-c "from server_control import prepare_start; prepare_start()"' 'server-control-error.log'
+    if ($controlResult.ExitCode -ne 0) { throw 'Server shutdown is still in progress or its status is invalid. See server-control-error.log.' }
 
 if (-not (Get-Process -Name 'LM Studio' -ErrorAction SilentlyContinue) -and -not (Test-LocalService 'http://127.0.0.1:1234/v1/models')) {
     Start-Process -FilePath (Join-Path $env:LOCALAPPDATA 'Programs\LM Studio\LM Studio.exe') -WindowStyle Hidden
