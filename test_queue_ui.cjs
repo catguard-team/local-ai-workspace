@@ -24,14 +24,14 @@ class Element {
   requestSubmit() { this.submissions=(this.submissions||0)+1; }
 }
 
-function harness() {
+function harness(search = '') {
   const elements=new Map(),timers=new Map(),documentEvents={},calls=[];
   let now=100000,sequence=0;
   const get=id=>{if(!elements.has(id))elements.set(id,new Element(id));return elements.get(id);};
   const document={hidden:false,getElementById:get,querySelectorAll:()=>[],createElement:()=>new Element(),addEventListener:(name,fn)=>{documentEvents[name]=fn;},documentElement:{style:{setProperty(){},removeProperty(){}}},body:new Element()};
-  const context=vm.createContext({console,URL,URLSearchParams,Headers,FormData,Map,Set,document,navigator:{},history:{replaceState(){}},window:{location:{search:'',href:'http://localhost/'},innerWidth:1280,addEventListener(){}},performance:{now:()=>now},Date:class extends Date{static now(){return now;}},setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
+  const context=vm.createContext({console,URL,URLSearchParams,Headers,FormData,Map,Set,document,navigator:{},history:{replaceState(){}},window:{location:{search,href:'http://localhost/'+search},innerWidth:1280,addEventListener(){}},performance:{now:()=>now},Date:class extends Date{static now(){return now;}},setTimeout:(fn,delay)=>{const id=++sequence;timers.set(id,{fn,due:now+delay});return id;},clearTimeout:id=>timers.delete(id)});
   vm.runInContext(source.replace('api("/api/me").then(enterApp).catch(()=>showLogin());',''),context);
-  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin,loadChats,openDeleteChat,openSettings})',context);
+  const ui=vm.runInContext('({state,requestView,setRequestState,renderQueue,renderMessages,refreshLiveState,scheduleLivePoll,showLogin,loadChats,openDeleteChat,openSettings,openStartupSettings})',context);
   ui.state.me={username:'test'};
   context.mockApi=async route=>{calls.push(route);return route==='/api/queue'?{server_busy:false,queue_waiting:0}:{id:ui.state.chat,messages:[],mode:'chat',running:false,request_state:'idle'};};
   vm.runInContext('api=(...args)=>globalThis.mockApi(...args);',context);
@@ -120,6 +120,14 @@ async function main(){
   });
   await test('busy shutdown response keeps the app usable',async()=>{
     const h=harness();h.ui.state.canShutdown=true;h.context.mockApi=async()=>{throw new Error('진행 중 요청을 완료');};h.get('shutdown-open').listeners.click();await h.get('shutdown-confirm').listeners.click();assert.equal(h.ui.state.serverStopped,false);assert.match(h.get('shutdown-error').textContent,/진행 중/);assert.equal(h.get('shutdown-confirm').disabled,false);
+  });
+  await test('shutdown shortcut opens confirmation after login and never shuts down just from the URL',async()=>{
+    for(const allowed of [true,false]){
+      const h=harness('?shutdown=1');let mutations=0;
+      h.context.mockApi=async(route,options={})=>{if(options.method)mutations++;assert.equal(route,'/api/settings');return{max_response_minutes:60,max_queue_wait_minutes:120,can_shutdown:allowed};};
+      await h.ui.openStartupSettings();assert.equal(mutations,0);assert.equal(h.get('settings-dialog').open,true);assert.equal(!!h.get('shutdown-dialog').open,allowed);assert.equal(h.ui.state.serverStopped,false);
+      if(allowed){h.get('shutdown-cancel').listeners.click();await h.ui.openStartupSettings();assert.equal(h.get('shutdown-dialog').open,false);}
+    }
   });
   console.log(`${count} queue UI checks passed.`);
 }

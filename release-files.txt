@@ -63,3 +63,4 @@ scripts/check-local.ps1
 server_control.py
 test_server_control.py
 서버관리.cmd
+종료.cmd

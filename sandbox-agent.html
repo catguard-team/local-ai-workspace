@@ -82,7 +82,8 @@ html,body{height:100%;overscroll-behavior:none}body{overflow:hidden}.login{heigh
 const $=id=>document.getElementById(id);
 let initialModeRequested=new URLSearchParams(window.location.search).get("mode")==="agent"?"agent":"chat";
 if(new URLSearchParams(window.location.search).has("mode")){const clean=new URL(window.location.href);clean.searchParams.delete("mode");history.replaceState(null,"",clean.pathname+clean.search+clean.hash);}
-let initialSettingsRequested=new URLSearchParams(window.location.search).get("settings")==="1";
+let initialShutdownRequested=new URLSearchParams(window.location.search).get("shutdown")==="1";
+let initialSettingsRequested=initialShutdownRequested||new URLSearchParams(window.location.search).get("settings")==="1";
 const state={settingsBusy:false,shutdownBusy:false,serverStopped:false,canShutdown:false,chatsLoad:0,deleteChatId:null,deleteBusy:false,me:null,chat:null,mode:"chat",modeBusy:false,running:false,requestState:"idle",cancelBusy:false,pending:[],uploading:false,poll:null,polling:false,pollAgain:false,nextChatPoll:0,nextQueuePoll:0,epoch:0,authEpoch:0,folder:"",file:null,saved:"",creating:"file",nodes:new Map(),requestBusy:false,composing:false,lastCompositionEnd:0};
 const roles={user:"나",assistant:"Local AI",tool:"파일 작업",system:"안내"};
 // marked supplies tokens only. Untrusted Markdown is never inserted as HTML.
@@ -109,7 +110,7 @@ async function api(path,options={}){
   return data;
 }
 function showLogin(){state.authEpoch++;state.canShutdown=false;$("settings-dialog").close();$("shutdown-dialog").close();state.chatsLoad++;state.deleteChatId=null;$("delete-chat-dialog").close();state.me=null;resetChat();state.pending=[];renderPending();state.file=null;state.saved="";state.folder="";state.composing=false;$("editor-content").value="";$("editor").hidden=true;$("message-input").value="";$("chat-list").replaceChildren();$("file-list").replaceChildren();$("uploads-list").replaceChildren();$("uploads-dialog").close();$("path-dialog").close();$("app").hidden=true;$("login-screen").hidden=false;$("password").value="";renderQueue(null);updateSend();}
-async function enterApp(me){state.authEpoch++;state.serverStopped=false;state.me=me;$("agent-boundary").querySelector("code").textContent=me.root||"agent/";applyMode(initialModeRequested);initialModeRequested="chat";$("account-name").textContent=me.username;$("model-name").textContent=(me.model||"qwen3.8-27b")+" · LM Studio";$("login-screen").hidden=true;$("app").hidden=false;showError("login-error",null);state.nextQueuePoll=0;scheduleLivePoll();await loadChats();if(initialSettingsRequested){initialSettingsRequested=false;await openSettings();}}
+async function enterApp(me){state.authEpoch++;state.serverStopped=false;state.me=me;$("agent-boundary").querySelector("code").textContent=me.root||"agent/";applyMode(initialModeRequested);initialModeRequested="chat";$("account-name").textContent=me.username;$("model-name").textContent=(me.model||"qwen3.8-27b")+" · LM Studio";$("login-screen").hidden=true;$("app").hidden=false;showError("login-error",null);state.nextQueuePoll=0;scheduleLivePoll();await loadChats();await openStartupSettings();}
 $("login-form").addEventListener("submit",async e=>{e.preventDefault();$("login-button").disabled=true;showError("login-error",null);try{await api("/api/login",{method:"POST",body:{username:$("username").value.trim(),password:$("password").value}});$("password").value="";await enterApp(await api("/api/me"));}catch(err){showError("login-error",err);}finally{$("login-button").disabled=false;}});
 $("logout").addEventListener("click",async()=>{try{await api("/api/logout",{method:"POST"});showLogin();resetChat();}catch(err){showError("global-error",err);}});
 function settingsBusy(busy){state.settingsBusy=busy;for(const id of ["settings-save","response-minutes","wait-minutes"])$(id).disabled=busy;$("shutdown-open").disabled=busy||!state.canShutdown;}
@@ -132,7 +133,9 @@ $("settings-form").addEventListener("submit",async e=>{
   catch(err){showError("settings-error",err);}
   finally{settingsBusy(false);}
 });
-$("shutdown-open").addEventListener("click",()=>{if(!state.canShutdown||state.settingsBusy||state.serverStopped)return;showError("shutdown-error",null);$("shutdown-dialog").showModal();$("shutdown-cancel").focus();});
+function openShutdown(){if(!state.canShutdown||state.settingsBusy||state.serverStopped)return;showError("shutdown-error",null);$("shutdown-dialog").showModal();$("shutdown-cancel").focus();}
+async function openStartupSettings(){if(!initialSettingsRequested)return;initialSettingsRequested=false;await openSettings();if(initialShutdownRequested){initialShutdownRequested=false;openShutdown();}}
+$("shutdown-open").addEventListener("click",openShutdown);
 $("shutdown-cancel").addEventListener("click",()=>{if(!state.shutdownBusy)$("shutdown-dialog").close();});
 $("shutdown-dialog").addEventListener("cancel",e=>{if(state.shutdownBusy)e.preventDefault();});
 $("shutdown-confirm").addEventListener("click",async()=>{
